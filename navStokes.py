@@ -4,6 +4,7 @@ from matplotlib.animation import FuncAnimation
 from scipy.sparse import diags, csr_matrix
 from scipy.sparse.linalg import spsolve, splu
 import time
+from scipy.ndimage import distance_transform_edt
 
 class NavierStokesSolver2D:
     """
@@ -11,7 +12,7 @@ class NavierStokesSolver2D:
     for handling complex geometries like cylinders and airfoils
     """
     
-    def __init__(self, nx, ny, Lx, Ly, Re, dtMax=0.01, geometry_type='cylinder', use_sparse_solver=True):
+    def __init__(self, nx, ny, Lx, Ly, Re, dtMax=0.01, geometry_type='cylinder', use_sparse_solver=True, alpha_deg=0.0):
         # Grid parameters
         self.nx, self.ny = nx, ny
         self.Lx, self.Ly = Lx, Ly
@@ -24,6 +25,21 @@ class NavierStokesSolver2D:
         self.Re = Re  # Reynolds number
         self.nu = 1.0 / Re  # Kinematic viscosity
         
+        self.rho = 1.0
+        self.U_inf = 1.0
+
+        # Reference length for coefficient normalisation
+        # Use chord for airfoils, diameter for cylinder
+        if geometry_type == 'cylinder':
+            self.L_ref = 2 * min(self.Lx, self.Ly) * 0.1   # set this equal to your cylinder diameter in nondimensional units
+        elif geometry_type in ['naca0012', 'naca4412']:
+            self.L_ref = min(self.Lx, self.Ly) * 0.4
+        else:
+            self.L_ref = 1.0  # fallback
+
+        # Flow direction angle in radians
+        # If freestream is horizontal, leave at 0.0
+        self.flow_angle = 0.0
         # Solver options
         self.use_sparse_solver = use_sparse_solver
         
@@ -43,6 +59,8 @@ class NavierStokesSolver2D:
         
         # Create geometry mask
         self.geometry_type = geometry_type
+        self.alpha_deg = alpha_deg
+        self.alpha = np.deg2rad(alpha_deg)
         self.solid_mask = self.create_geometry_mask()
         
         # Initialize boundary conditions
@@ -51,80 +69,194 @@ class NavierStokesSolver2D:
         # Clear the pressure matrix cache
         self._pressure_matrix = None
         self.pressure_lu = None
+
+        # RANS: Spalart-Allmaras toggle
+        self.useSa = True # set False to revert to laminar
+
+        # SA working variable (nuTilde) and turbulent viscosity nuT
+        self.nuTilde = np.zeros((nx,ny), dtype=np.float64)
+        self.nuT = np.zeros((nx, ny), dtype=np.float64)
+
+        # Precompute wall distance to the immersed body (solid mask)
+        self.wallDist = self.computeWallDistance()
+
+        # Optional: set a small freestream turbulence level (dimensionless-ish)
+        # For a "turbulent" inlet, nuTildeInfinity ~ (3-5)*nu is a commonish as a starting point
+        self.nuTilde[:,:] = 3.0 * self.nu
+        self.nuTilde[self.solid_mask] = 0.0
         
     def create_geometry_mask(self):
-        """Create mask for solid boundaries (True = solid, False = fluid)"""
+        """Create mask for solid boundaries (True = solid, False = fluid).
+
+        Fast, vectorized geometry creation for:
+        - 'cylinder'
+        - 'naca0012'  (also aliased by 'airfoil')
+        - 'naca4412'
+
+        Optional angle-of-attack support:
+        - If self.alpha_deg exists: degrees
+        - Else if self.alpha exists: radians
+        - Else: 0
+        """
+
         mask = np.zeros((self.nx, self.ny), dtype=bool)
-        
-        if self.geometry_type == 'cylinder':
-            # Circular cylinder at center
-            center_x, center_y = self.Lx * 0.3, self.Ly * 0.5
+
+        # Geometry placement (keep your original intent)
+        center_x, center_y = self.Lx * 0.3, self.Ly * 0.5
+
+        # Optional AoA support (body rotated by +alpha relative to flow)
+        if hasattr(self, "alpha_deg"):
+            alpha = np.deg2rad(float(self.alpha_deg))
+        elif hasattr(self, "alpha"):
+            alpha = float(self.alpha)
+        else:
+            alpha = 0.0
+
+        # Shift to body-centered coordinates
+        x0 = self.X - center_x
+        y0 = self.Y - center_y
+
+        # Rotate grid into body frame by -alpha (so body appears at +alpha in lab frame)
+        ca = np.cos(alpha)
+        sa = np.sin(alpha)
+        Xr = x0 * ca - y0 * sa
+        Yr = x0 * sa + y0 * ca
+
+        # -------------------------
+        # Cylinder
+        # -------------------------
+        if self.geometry_type == "cylinder":
             radius = min(self.Lx, self.Ly) * 0.1
-            
-            for i in range(self.nx):
-                for j in range(self.ny):
-                    if (self.X[i,j] - center_x)**2 + (self.Y[i,j] - center_y)**2 <= radius**2:
-                        mask[i,j] = True
-                        
-        elif self.geometry_type == 'naca0012':
-            # NACA 0012 airfoil
-            center_x, center_y = self.Lx * 0.3, self.Ly * 0.5
-            chord = min(self.Lx, self.Ly) * 0.4  # Larger chord for visibility
-            
-            for i in range(self.nx):
-                for j in range(self.ny):
-                    x_rel = (self.X[i,j] - center_x) / chord
-                    y_rel = (self.Y[i,j] - center_y) / chord
-                    
-                    # Check if point is within airfoil chord length
-                    if 0 <= x_rel <= 1:
-                        # NACA 0012 thickness distribution (half-thickness)
-                        t = 0.12  # Maximum thickness ratio
-                        yt = (t/0.2) * (0.2969*np.sqrt(x_rel) - 0.1260*x_rel - 
-                              0.3516*x_rel**2 + 0.2843*x_rel**3 - 0.1015*x_rel**4)
-                        
-                        # Point is inside airfoil if within thickness envelope
-                        if abs(y_rel) <= yt:
-                            mask[i,j] = True
+            mask = (Xr**2 + Yr**2) <= radius**2
+            return mask
 
-        elif self.geometry_type == 'naca4412':
-            # NACA 4412 airfoil parameters
-            center_x, center_y = self.Lx * 0.3, self.Ly * 0.5
-            chord = min(self.Lx, self.Ly) * 0.4 # Chord length
+        # -------------------------
+        # NACA airfoils
+        # -------------------------
+        geom = self.geometry_type.lower()
+        if geom == "airfoil":   # your original alias
+            geom = "naca0012"
 
-            m = 0.04
-            p = 0.4
-            t = 0.12
+        if geom not in ("naca0012", "naca4412"):
+            # Unknown geometry -> no obstacle
+            return mask
 
-            for i in range(self.nx):
-                for j in range(self.ny):
-                    x = (self.X[i, j] - center_x) / chord
-                    y = (self.Y[i, j] - center_y) / chord
+        # Use your existing chord definition (but vectorized)
+        chord = min(self.Lx, self.Ly) * 0.4
 
-                    if 0 <= x <= 1:
-                        # thickness distribution
-                        yt =  5 * t * (0.2969 * np.sqrt(x) - 0.1260 * x
-                            - 0.3516 * x**2 + 0.2843 * x**3 - 0.1015 * x**4)
+        # Non-dimensional coordinates in body frame
+        x = Xr / chord
+        y = Yr / chord
 
-                        # Camber line and slope
-                        if x < p:
-                            yc = (m / p**2) * (2 * p * x - x**2)
-                            dyc_dx = (2 * m / p**2) * (p - x)
-                        else:
-                            yc = (m / (1 - p)**2) * ((1 - 2 * p) + 2 * p * x - x**2)
-                            dyc_dx = (2 * m / (1 - p)**2) * (p - x)
+        # Only consider points inside chord range (0..1)
+        inside_chord = (x >= 0.0) & (x <= 1.0)
 
-                        theta = np.arctan(dyc_dx)
+        # Thickness distribution (NACA 4-digit), half-thickness yt(x)
+        # Using the common "closed trailing edge" coefficient -0.1015
+        t = 0.12
+        x_clip = np.clip(x, 1e-12, 1.0)  # avoid sqrt(0) issues
+        yt = 5.0 * t * (0.2969 * np.sqrt(x_clip) - 0.1260 * x_clip
+                        - 0.3516 * x_clip**2 + 0.2843 * x_clip**3 - 0.1015 * x_clip**4)
 
-                        # Rotate coordinates into airfoil frame
-                        y_upper = yc + yt * np.cos(theta)
-                        y_lower = yc - yt * np.cos(theta)
+        if geom == "naca0012":
+            # Symmetric: camber line is zero; thickness is vertical envelope
+            mask = inside_chord & (np.abs(y) <= yt)
+            return mask
 
-                        if y_lower <= y <= y_upper:
-                            mask[i, j] = True
+        # -------------------------
+        # NACA 4412 (cambered)
+        # -------------------------
+        m = 0.04
+        p = 0.4
 
+        # Camber line yc(x) and slope dyc/dx (vectorized)
+        yc = np.zeros_like(x, dtype=float)
+        dyc_dx = np.zeros_like(x, dtype=float)
 
+        # Only defined meaningfully on chord
+        x_in = np.clip(x, 0.0, 1.0)
+
+        left = x_in < p
+        right = ~left
+
+        # Camber line
+        yc[left] = (m / p**2) * (2.0 * p * x_in[left] - x_in[left]**2)
+        yc[right] = (m / (1.0 - p)**2) * ((1.0 - 2.0 * p) + 2.0 * p * x_in[right] - x_in[right]**2)
+
+        # Slope
+        dyc_dx[left] = (2.0 * m / p**2) * (p - x_in[left])
+        dyc_dx[right] = (2.0 * m / (1.0 - p)**2) * (p - x_in[right])
+
+        theta = np.arctan(dyc_dx)
+
+        # Build *proper* upper/lower surface coordinates (xu,yu) and (xl,yl)
+        # xu = x - yt*sin(theta), yu = yc + yt*cos(theta)
+        # xl = x + yt*sin(theta), yl = yc - yt*cos(theta)
+        xu = x_in - yt * np.sin(theta)
+        yu = yc + yt * np.cos(theta)
+        xl = x_in + yt * np.sin(theta)
+        yl = yc - yt * np.cos(theta)
+
+        # To test if a grid point is inside the airfoil, we need y between y_lower(x) and y_upper(x).
+        # Because xu/xl are slightly shifted in x, we build interpolants yU(x) and yL(x).
+
+        # Create 1D airfoil surface curves for interpolation (fast and stable)
+        n_surf = 600
+        xs = np.linspace(0.0, 1.0, n_surf)
+        xs_clip = np.clip(xs, 1e-12, 1.0)
+
+        yt_s = 5.0 * t * (0.2969 * np.sqrt(xs_clip) - 0.1260 * xs_clip
+                        - 0.3516 * xs_clip**2 + 0.2843 * xs_clip**3 - 0.1015 * xs_clip**4)
+
+        yc_s = np.empty_like(xs)
+        dyc_s = np.empty_like(xs)
+
+        left_s = xs < p
+        right_s = ~left_s
+
+        yc_s[left_s] = (m / p**2) * (2.0 * p * xs[left_s] - xs[left_s]**2)
+        yc_s[right_s] = (m / (1.0 - p)**2) * ((1.0 - 2.0 * p) + 2.0 * p * xs[right_s] - xs[right_s]**2)
+
+        dyc_s[left_s] = (2.0 * m / p**2) * (p - xs[left_s])
+        dyc_s[right_s] = (2.0 * m / (1.0 - p)**2) * (p - xs[right_s])
+
+        theta_s = np.arctan(dyc_s)
+
+        xu_s = xs - yt_s * np.sin(theta_s)
+        yu_s = yc_s + yt_s * np.cos(theta_s)
+        xl_s = xs + yt_s * np.sin(theta_s)
+        yl_s = yc_s - yt_s * np.cos(theta_s)
+
+        # Sort by x for monotone interpolation
+        iu = np.argsort(xu_s)
+        il = np.argsort(xl_s)
+        xu_s, yu_s = xu_s[iu], yu_s[iu]
+        xl_s, yl_s = xl_s[il], yl_s[il]
+
+        # Interpolate upper/lower y at the grid point x-locations
+        x_flat = x.ravel()
+        y_flat = y.ravel()
+        inside_flat = inside_chord.ravel()
+
+        yU = np.full_like(x_flat, np.nan, dtype=float)
+        yL = np.full_like(x_flat, np.nan, dtype=float)
+
+        # Only interpolate where inside chord to avoid meaningless extrapolation
+        idx = np.where(inside_flat)[0]
+        xq = x_flat[idx]
+
+        # np.interp extrapolates by endpoints; we want NaN outside valid surface x-range
+        # so we clip query to [min(x_surf), max(x_surf)] and then apply chord mask anyway.
+        xq_clip = np.clip(xq, xu_s[0], xu_s[-1])
+        yU[idx] = np.interp(xq_clip, xu_s, yu_s)
+
+        xq_clip = np.clip(xq, xl_s[0], xl_s[-1])
+        yL[idx] = np.interp(xq_clip, xl_s, yl_s)
+
+        inside_airfoil = inside_flat & (y_flat >= yL) & (y_flat <= yU)
+        mask = inside_airfoil.reshape(self.nx, self.ny)
         return mask
+
 
     def set_initial_conditions(self):
         """Set initial flow conditions"""
@@ -161,6 +293,133 @@ class NavierStokesSolver2D:
         
         return u, v, p
     
+    def computeWallDistance(self):
+        """
+        Distance (metres) from each fluid cell to the nearest solid cell.
+        Uses Euclidean distance transform on the grid.
+        """
+        fluid = ~self.solid_mask
+        d = distance_transform_edt(fluid) * min(self.dx, self.dy)
+        d[self.solid_mask] = 0.0
+        # Avoid division by zero in SA source terms
+        
+        return np.maximum(d, 1e-12)
+    
+
+    def saConstants(self):
+        # Standard SA constants
+
+         return {
+            "sigma": 2.0/3.0,
+            "cb1": 0.1355,
+            "cb2": 0.622,
+            "kappa": 0.41,
+            "cw2": 0.3,
+            "cw3": 2.0,
+            "cv1": 7.1,
+        }
+
+    def  saUpdate_nuT(self):
+        """
+        Compute nuT from nuTilde via fv1
+        """
+        c = self.saConstants()
+        cv1 = c["cv1"]
+
+        nu = self.nu
+        nuTilde = np.maximum(self.nuTilde, 0.0)
+
+        chi = nuTilde / (nu + 1e-12)
+        fv1 = (chi**3) / (chi**3 + cv1**3 + 1e-12)
+
+        self.nuT = nuTilde * fv1
+
+    def saStep(self):
+        """
+        One explicit time step of Spalart-Allmaras for nuTilde.
+        Simplified out but useful for teaching / demos
+        """
+
+        c = self.saConstants()
+        sigma = c["sigma"]
+        cb1 = c["cb1"]
+        cb2 = c["cb2"]
+        kappa = c["kappa"]
+        cw2 = c["cw2"]
+        cw3 =  c["cw3"]
+        cv1 = c["cv1"]
+
+        # Derived constant
+        cw1 = cb1 / (kappa**2) + (1.0 + cb2) / sigma
+
+        nu = self.nu
+        d = self.wallDist
+        
+        # Current nuTidle
+        nuTilde = np.maximum(self.nuTilde, 0.0)
+
+        # Vorticity magnitude S = |dV/dx - dU/dy|
+        dudy = (self.u[1:-1, 2:] - self.u[1:-1, :-2]) / (2.0 * self.dy) 
+        dvdx = (self.v[2:, 1:-1] - self.v[:-2, 1:-1]) / (2.0 * self.dx)
+        S = np.zeros_like(self.u)
+        S[1:-1,1:-1] = np.abs(dvdx - dudy)
+
+        # fv1, fv2
+        chi = nuTilde / (nu + 1e-12)
+        fv1 = (chi**3) / (chi**3 + cv1**3 + 1e-12)
+        fv2 = 1.0 - chi / (1.0 + chi * fv1 + 1e-12)
+
+        # Modified vorticity magnitude S~
+        Stilde = S + (nuTilde / (kappa**2 * d**2 + 1e-12)) * fv2
+        Stilde = np.maximum(Stilde, 1e-12)
+
+        # Production term
+        prod = cb1 * Stilde * nuTilde
+
+        # Destruction term pieces (fw)
+        r = nuTilde / (Stilde * (kappa**2) * d**2 + 1e-12)
+        r = np.clip(r, 0.0, 10.0)
+
+        g = r + cw2 * (r**6 - r)
+        fw = g * ((1.0 + cw3**6) / (g**6 + cw3**6 + 1e-12))**(1.0/6.0)
+
+        dest = cw1 * fw * (nuTilde / (d + 1e-12))**2
+
+        # Advection of nuTidle (Simple Central)
+        nt = nuTilde
+        dnt_dx = np.zeros_like(nt)
+        dnt_dy = np.zeros_like(nt)
+        dnt_dx[1:-1, 1:-1] = (nt[2:, 1:-1] - nt[:-2, 1:-1]) / (2.0 * self.dx)
+        dnt_dy[1:-1, 1:-1] = (nt[1:-1, 2:] - nt[1:-1, :-2]) / (2.0 * self.dy)
+
+        adv = self.u * dnt_dx + self.v * dnt_dy
+
+        # Diffusion term
+        ntc = nt[1:-1, 1:-1]
+        lap_nt  = ((nt[2:, 1:-1] - 2.0 * ntc + nt[:-2, 1:-1]) / (self.dx**2) +
+              (nt[1:-1, 2:] - 2.0 * ntc + nt[1:-1, :-2]) / (self.dy**2))
+        
+        nuEff_nt = (nu + nt) / sigma
+        diff = np.zeros_like(nt)
+        diff[1:-1, 1:-1] = nuEff_nt[1:-1, 1:-1] * lap_nt
+
+        # Cross-diffusion term
+        grad2 = dnt_dx**2 + dnt_dy**2
+        cross = (cb2 / sigma) * grad2
+
+        # Explicit update
+        rhs = -adv + diff + cross + prod - dest
+        nuTilde_new = nuTilde + self.dt * rhs
+
+        # Enforce BC's - 0 on solid and clamp negative
+        nuTilde_new[self.solid_mask] = 0.0
+        nuTilde_new = np.maximum(nuTilde_new, 0.0)
+
+        # Simple inlet BC - freestream turbulence level
+        nuTilde_new[0, :] = 3.0 * nu
+
+        self.nuTilde = nuTilde_new
+
     def minmod(self, a, b):
         """Minmod limiter (vectorised)"""
 
@@ -181,7 +440,7 @@ class NavierStokesSolver2D:
 
         # Faces i+1/2 for i=1,nx-3 => between qc[:-1] and qc[1:]
         qL = qc[:-1, :] + 0.5 * slope[:-1, :]
-        qR = qc[1:, :] - 0.5 * slope[:1, :]
+        qR = qc[1:, :] - 0.5 * slope[1:, :]
 
         return qL, qR
     
@@ -270,9 +529,14 @@ class NavierStokesSolver2D:
         lap_v = ((v[2:, 1:-1] - 2.0 * vc + v[:-2, 1:-1]) / (self.dx ** 2) +
                 (v[1:-1, 2:] - 2.0 * vc + v[1:-1, :-2]) / (self.dy ** 2))
 
-        diff_u[1:-1, 1:-1] = self.nu * lap_u
-        diff_v[1:-1, 1:-1] = self.nu * lap_v
-        
+        if self.useSa:
+            nuEff = self.nu + self.nuT
+        else:
+            nuEff = self.nu
+
+        diff_u[1:-1, 1:-1] = nuEff[1:-1, 1:-1] * lap_u
+        diff_v[1:-1, 1:-1] = nuEff[1:-1, 1:-1] * lap_v
+
         # Solids: zero out and keep boundaries zero
         conv_u[self.solid_mask] = 0.0
         conv_v[self.solid_mask] = 0.0
@@ -468,6 +732,11 @@ class NavierStokesSolver2D:
 
     def time_step(self):
         """Perform one time step using fractional step (projection) method."""
+        
+        if self.useSa:
+            self.saStep()
+            self.saUpdate_nuT()
+        
         # Adaptive CFL timestep
         self.dt = self.computedtCFL(cfl=0.3, cflDiff=0.5, dtMin=1e-6, dtMax=1e-2)
         
@@ -503,57 +772,119 @@ class NavierStokesSolver2D:
         
     def compute_forces(self):
         """Compute drag and lift forces on the immersed body"""
-        drag, lift = 0.0, 0.0
-        
-        # Improved force calculation using pressure integration
-        for i in range(1, self.nx-1):
-            for j in range(1, self.ny-1):
-                if self.solid_mask[i,j]:
-                    # Check if this is a boundary point (adjacent to fluid)
-                    boundary_point = False
-                    normal_x, normal_y = 0.0, 0.0
-                    
-                    if not self.solid_mask[i+1,j]:  # Right neighbor is fluid
-                        boundary_point = True
-                        normal_x += 1.0
-                    if not self.solid_mask[i-1,j]:  # Left neighbor is fluid
-                        boundary_point = True
-                        normal_x -= 1.0
-                    if not self.solid_mask[i,j+1]:  # Top neighbor is fluid
-                        boundary_point = True
-                        normal_y += 1.0
-                    if not self.solid_mask[i,j-1]:  # Bottom neighbor is fluid
-                        boundary_point = True
-                        normal_y -= 1.0
-                    
-                    if boundary_point:
-                        # Normalize normal vector
-                        norm = np.sqrt(normal_x**2 + normal_y**2)
-                        if norm > 0:
-                            normal_x /= norm
-                            normal_y /= norm
-                            
-                            # Get pressure at boundary (interpolate from nearby fluid points)
-                            p_boundary = 0.0
-                            count = 0
-                            for di in [-1, 0, 1]:
-                                for dj in [-1, 0, 1]:
-                                    ni, nj = i + di, j + dj
-                                    if (0 <= ni < self.nx and 0 <= nj < self.ny and 
-                                        not self.solid_mask[ni, nj]):
-                                        p_boundary += self.p[ni, nj]
-                                        count += 1
-                            
-                            if count > 0:
-                                p_boundary /= count
-                                
-                                # Force contribution (pressure * area * normal)
-                                area_element = self.dx * self.dy
-                                drag += p_boundary * normal_x * area_element
-                                lift += p_boundary * normal_y * area_element
-        
-        return drag, lift
+        Fx = 0.0
+        Fy = 0.0
+
+        for i in range(1, self.nx - 1):
+            for j in range(1, self.ny - 1):
+                if not self.solid_mask[i, j]:
+                    continue
+
+                # Check whether this solid cell is on the boundary 
+                right_fluid = not self.solid_mask[i + 1, j]
+                left_fluid = not self.solid_mask[i - 1, j]
+                top_fluid = not self.solid_mask[i, j + 1]
+                bottom_fluid = not self.solid_mask[i, j - 1]
+
+                if not (right_fluid or left_fluid or top_fluid or bottom_fluid):
+                    continue
+
+                # Outward normal estimate from solid to fluid neighbors
+                nx = 0.0
+                ny = 0.0
+
+                if right_fluid:
+                    nx += 1.0
+                if left_fluid:
+                    nx -= 1.0
+                if top_fluid:
+                    ny += 1.0
+                if bottom_fluid:
+                    ny-= 1.0
+                
+                norm = np.hypot(nx, ny)
+                if norm < 1e-12:
+                    continue
+
+                nx /= norm
+                ny /= norm
+
+                # Estimate local boundary segment lengths ds
+                # Mostly vertical normal -> vertical face -> ds ~ dy
+                # Mostly horizontal normal -> horizontal face -> ds ~ dx
+                # Diagonal/corner -> use doagonal length
+
+                if abs(nx) > 0.9 and abs(ny) < 0.1:
+                    ds = self.dy
+                elif abs(ny) > 0.9 and abs(nx) < 0.1:
+                    ds = self.dx
+                else:
+                    ds = np.sqrt(self.dx**2 + self.dy**2)
+
+                # Pressure at boundary: average only adjacent fluid neighbors
+                p_sum = 0.0
+                count = 0
+
+                if right_fluid:
+                    p_sum += self.p[i + 1, j]
+                    count+= 1 
+                if left_fluid:
+                    p_sum += self.p[i - 1, j]
+                    count += 1
+                if top_fluid:
+                    p_sum += self.p[i, j + 1]
+                    count += 1
+                if bottom_fluid:
+                    p_sum += self.p[i, j - 1]
+                    count += 1
+
+                if count == 0:
+                    continue
+
+                p_b = p_sum / count
+
+                # Pressure traction on body = -p * n
+                dFx = -p_b * nx * ds
+                dFy = -p_b * ny * ds
+
+                Fx += dFx 
+                Fy += dFy
+
+        Cd_p, Cl_p = self.compute_force_coefficients(Fx, Fy)
+
+        return Fx, Fy, Cd_p, Cl_p
     
+    def compute_force_coefficients(self, Fx, Fy):
+        """
+        Convert global force components to drag/lift coefficients.
+        Drag/lift are defined relative to freestream direction self.flow_angle
+        """
+
+        theta = self.flow_angle
+
+        # Unit vector along freestream (drag direction)
+        ex = np.cos(theta)
+        ey = np.sin(theta)
+
+        # Unit vector perpendicular to freestream (lift stream)
+        lx = -np.sin(theta)
+        ly = np.cos(theta)
+
+        # Project force vector onto drag/lift axes 
+        F_drag = Fx * ex + Fy * ey
+        F_lift = Fx * lx + Fy * ly
+
+        q_inf = 0.5 * self.rho * self.U_inf**2
+        denom = q_inf * self.L_ref
+
+        if denom < 1e-14:
+            return 0.0, 0.0
+        
+        Cd = F_drag / denom
+        Cl = F_lift / denom
+
+        return Cd, Cl
+        
     def run_simulation(self, n_steps, plot_interval=50):
         """Run the CFD simulation"""
         print(f"Running {self.geometry_type} simulation...")
@@ -580,10 +911,11 @@ class NavierStokesSolver2D:
             t += self.dt
             
             # Compute forces
-            drag, lift = self.compute_forces()
+            Fx, Fy, Cd_p, Cl_p = self.compute_forces()
+
             times.append(t)
-            drags.append(drag)
-            lifts.append(lift)
+            drags.append(Cd_p)
+            lifts.append(Cl_p)
             
             # Plot results periodically
             if step % plot_interval == 0:
@@ -596,8 +928,7 @@ class NavierStokesSolver2D:
                 u_max = np.max(np.sqrt(self.u**2 + self.v**2))
                 p_max = np.max(np.abs(self.p))
                 print(f"Step {step:4d}/{n_steps}, Time = {step*self.dt:6.3f}, "
-                      f"Max U = {u_max:.3f}, Max |P| = {p_max:.3f}, "
-                      f"Drag = {drag:.4f}, Lift = {lift:.4f}")
+                      f"Max U = {Fx:.4f}, Lift = {Fy:.4f}")
         
         plt.ioff()  # Turn off interactive mode
         input("Simulation done. Close when finished.")
@@ -694,15 +1025,15 @@ if __name__ == "__main__":
     # Simulation parameters - reduced for faster testing
     nx, ny = 400, 200      # Reduced grid resolution for faster computation
     Lx, Ly = 16.0, 10.5      # Domain size
-    Re = 10e5                # Reynolds number
-    dtMax = 0.005             # Smaller time step for stability
+    Re = 1000                # Reynolds number
+    dtMax = 1e-3             # Smaller time step for stability
     n_steps = 2000         # Number of time steps
     
     print("2D Navier-Stokes CFD Solver")
     print("=" * 40)
     
     # Choose geometry: 'cylinder' or 'airfoil'
-    geometry = 'naca0012'  # Start with cylinder for easier testing
+    geometry = 'naca4412'  # Start with cylinder for easier testing
     
     # Choose solver type
     use_sparse = True  # Sparse solver is generally more robust
@@ -713,7 +1044,7 @@ if __name__ == "__main__":
     # Create and run solver
     solver = NavierStokesSolver2D(nx, ny, Lx, Ly, Re, dtMax, 
                                 geometry_type=geometry, 
-                                use_sparse_solver=use_sparse)
+                                use_sparse_solver=use_sparse, alpha_deg=0.0)
     
     # Run simulation
     start_time = time.time()
