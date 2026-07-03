@@ -50,7 +50,7 @@ def create_geometry_mask(solver):
         # NACA airfoils
         # -------------------------
         geom = solver.geometry_type.lower()
-        if geom == "airfoil":   # your original alias
+        if geom == "airfoil":  
             geom = "naca0012"
 
         if geom not in ("naca0012", "naca4412"):
